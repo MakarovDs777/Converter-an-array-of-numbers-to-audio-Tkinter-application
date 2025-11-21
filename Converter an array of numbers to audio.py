@@ -5,10 +5,21 @@ import re
 import struct
 from pydub import AudioSegment
 
+# Новые импорты для функции "Случайный звук из файла"
+import threading
+import random
+import numpy as np
+import sounddevice as sd
+
 # Параметры по умолчанию (используются в режиме "legacy")
 DEFAULT_SAMPLE_RATE = 44100  # Гц
 DEFAULT_CHANNELS = 1
 DEFAULT_SAMPLE_WIDTH = 2     # bytes (16-bit)
+
+
+# Глобальные переменные для управления циклом случайного воспроизведения
+random_loop_thread = None
+random_loop_stop_event = None
 
 
 def parse_number_array(text):
@@ -68,6 +79,115 @@ def numbers_to_16bit_pcm(numbers):
             val = 32767
         pcm_bytes.extend(struct.pack('<h', val))
     return bytes(pcm_bytes)
+
+
+def _bytes_to_float32(raw_bytes, sample_width, channels):
+    """
+    Преобразует сырые PCM-байты в float32 в диапазоне [-1.0, 1.0] для sounddevice.
+    Поддерживаем типичные 8-bit unsigned и 16-bit signed.
+    Возвращает numpy.ndarray dtype=float32 с формой (n_frames,) или (n_frames, channels).
+    """
+    if len(raw_bytes) == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    if sample_width == 1:
+        # 8-bit PCM обычно unsigned: 0..255 -> -1..1
+        arr = np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32)
+        arr = (arr - 128.0) / 128.0
+    elif sample_width == 2:
+        arr = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+        arr = arr / 32768.0
+    else:
+        # fallback: попробуем интерпретировать как int16
+        arr = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+        arr = arr / 32768.0
+
+    if channels > 1:
+        try:
+            arr = arr.reshape(-1, channels)
+        except Exception:
+            # если reshape не удался, попытаемся добавить ось и дублировать
+            arr = arr.reshape(-1, 1)
+            if arr.shape[1] != channels:
+                # продублируем канал в случае несовпадения
+                arr = np.tile(arr, (1, channels))
+    return arr.astype(np.float32)
+
+
+def _loop_play_random_from_file(numbers, meta, stop_event):
+    """
+    Открывает sounddevice OutputStream один раз и в цикле пишет в него сгенерированные
+    случайные непрерывные фрагменты (минимизируем паузы).
+    """
+    if not numbers:
+        return
+
+    # Параметры аудио
+    frame_rate = DEFAULT_SAMPLE_RATE
+    channels = DEFAULT_CHANNELS
+    sample_width = DEFAULT_SAMPLE_WIDTH
+    if meta:
+        try:
+            if 'sample_rate' in meta:
+                frame_rate = int(meta['sample_rate'])
+            if 'channels' in meta:
+                channels = int(meta['channels'])
+            if 'sample_width' in meta:
+                sample_width = int(meta['sample_width'])
+        except Exception:
+            pass
+
+    # Параметры генерации
+    min_chunk_ms = 100   # минимальный кусок в ms
+    max_chunk_ms = 2000  # максимальный кусок в ms
+    play_buffer_ms = 5000  # длина буфера для одной записи в поток (ms)
+
+    bytes_per_sec = frame_rate * channels * sample_width
+
+    byte_array = bytes(numbers)
+    nbytes = len(byte_array)
+    if nbytes == 0:
+        return
+
+    # Открываем единый поток для вывода (dtype float32)
+    try:
+        with sd.OutputStream(samplerate=frame_rate, channels=channels, dtype='float32', latency='low') as stream:
+            while not stop_event.is_set():
+                # формируем один большой непрерывный байтовый буфер
+                buffer_bytes = bytearray()
+                buffer_ms_acc = 0
+                while buffer_ms_acc < play_buffer_ms and not stop_event.is_set():
+                    chunk_ms = random.randint(min_chunk_ms, max_chunk_ms)
+                    needed_bytes = max(1, int(bytes_per_sec * (chunk_ms / 1000.0)))
+                    if needed_bytes <= nbytes:
+                        start = random.randint(0, nbytes - needed_bytes)
+                        sel = byte_array[start:start + needed_bytes]
+                    else:
+                        reps = (needed_bytes + nbytes - 1) // nbytes
+                        sel = (byte_array * reps)[:needed_bytes]
+                    buffer_bytes.extend(sel)
+                    # приближённо пересчитываем длину в ms
+                    buffer_ms_acc = int((len(buffer_bytes) / bytes_per_sec) * 1000)
+
+                if len(buffer_bytes) == 0:
+                    continue
+
+                # Конвертируем в float32 и пишем в поток — запись происходит непрерывно в открытый поток
+                audio_np = _bytes_to_float32(buffer_bytes, sample_width, channels)
+                try:
+                    stream.write(audio_np)
+                except Exception:
+                    # если запись упала — даём короткий таймаут и пробуем снова
+                    if stop_event.wait(0.05):
+                        break
+                    continue
+    except Exception as e:
+        # При ошибке открытия аудиоустройства — покажем пользователю (GUI-поток не блокируем здесь)
+        try:
+            messagebox.showerror("Ошибка аудио", f"Не удалось открыть аудиопоток: {e}")
+        except Exception:
+            pass
+        return
 
 
 def create_mp3_from_numbers(numbers, meta=None, duration_sec=None, output_name="evp_audio.mp3"):
@@ -311,6 +431,51 @@ def on_load_audio_and_convert():
     messagebox.showinfo("Готово", f"Файл чисел сохранён на рабочем столе:\n{out_path}\nСэмплов: {samples}\nПримерная длительность: {duration:.3f} с")
 
 
+def on_random_sound_from_file_toggle():
+    """
+    Обработчик кнопки "Случайный звук из файла (Старт/Стоп)".
+    Запускает/останавливает фоновый поток, который непрерывно проигрывает случайные фрагменты.
+    """
+    global random_loop_thread, random_loop_stop_event, random_file_btn
+
+    # Если цикл уже запущен — остановим
+    if random_loop_thread and random_loop_thread.is_alive():
+        random_loop_stop_event.set()
+        random_loop_thread.join(timeout=2.0)
+        random_loop_thread = None
+        random_loop_stop_event = None
+        messagebox.showinfo("Стоп", "Бесконечный цикл случайных звуков остановлен.")
+        random_file_btn.config(text="Случайный звук из файла (Старт)")
+        return
+
+    # Выбрать файл
+    file_path = filedialog.askopenfilename(title="Выберите текстовый файл с числами",
+                                           filetypes=[("Text files", ".txt .csv .log .dat"), ("All files", "*")])
+    if not file_path:
+        return
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = f.read()
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+        return
+
+    try:
+        numbers, meta = parse_number_array(data)
+    except ValueError as e:
+        messagebox.showerror("Ошибка парсинга", str(e))
+        return
+
+    # Готово — запускаем цикл из данных файла
+    stop_event = threading.Event()
+    random_loop_stop_event = stop_event
+    thread = threading.Thread(target=_loop_play_random_from_file, args=(numbers, meta, stop_event), daemon=True)
+    random_loop_thread = thread
+    thread.start()
+    messagebox.showinfo("Старт", "Запущен бесконечный цикл случайных звуков из выбранного файла (нажатие кнопки остановит).")
+    random_file_btn.config(text="Случайный звук из файла (Стоп)")
+
+
 create_btn = tk.Button(button_frame, text="Создать MP3 из поля ввода", command=on_create_from_text, width=30)
 create_btn.grid(row=0, column=0, padx=8, pady=4)
 
@@ -324,8 +489,12 @@ load_create_btn.grid(row=0, column=2, padx=8, pady=4)
 audio_btn = tk.Button(button_frame, text="Загрузить аудио и сохранить числа (lossless)", command=on_load_audio_and_convert, width=44)
 audio_btn.grid(row=1, column=0, columnspan=2, padx=8, pady=6)
 
+# НОВАЯ КНОПКА: Случайный звук из файла (Старт/Стоп)
+random_file_btn = tk.Button(button_frame, text="Случайный звук из файла (Старт)", command=on_random_sound_from_file_toggle, width=44)
+# Помещаем в свободную ячейку (ряд 1, колонка 2) рядом с audio_btn
+random_file_btn.grid(row=1, column=2, padx=8, pady=6)
+
 quit_btn = tk.Button(root, text="Выйти", command=root.quit, width=12)
 quit_btn.pack(pady=12)
 
 root.mainloop()
-
